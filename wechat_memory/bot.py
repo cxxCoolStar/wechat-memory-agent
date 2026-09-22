@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timedelta
 from typing import Dict, List
 
 from .commands.router import Command, CommandRouter
 from .config import Config, load_config
 from .ingest.pipeline import IngestPipeline
+from .ingest.distill import DistillEngine
 from .models import Message
 from .search import llm_fallback as llm_fb
 from .search.query_parser import parse_query
@@ -52,7 +54,9 @@ class MemoryAgent:
         self.searcher = Searcher(self.conn)
         self.history = llm_fb.ConversationHistory()
         self.trash = TrashManager(self.cfg, self.conn)
+        self.distill = DistillEngine(self.cfg, self.conn)
         self.wx = WeixinClient(self.cfg)
+        self._pending_km: Dict[str, dict] = {}  # session -> pending round
 
     # -- wiring ------------------------------------------------------------
     def _wire(self) -> None:
@@ -136,6 +140,8 @@ class MemoryAgent:
             await self._reply_undo(message)
         elif cmd.name == "trash":
             await self._reply_trash(message, cmd)
+        elif cmd.name == "km":
+            await self._reply_km(message, cmd)
         elif cmd.name in ("all", "list"):
             await self._reply_all(message)
         elif cmd.name == "help":
@@ -163,6 +169,95 @@ class MemoryAgent:
             lines.append(f"{i}. {icon} {h.timestamp:%m-%d} | {title[:40]}")
         lines.append("")
         lines.append("回复 /1 /2 ... 查看详情并取回原文件；/N 删除 删除某条")
+        await self.wx.send_text(message.session, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # knowledge distillation (daily merge proposals)
+    # ------------------------------------------------------------------
+    async def _distill_daily(self, session: str) -> None:
+        """Daily consolidation: generate merge proposals and push them once."""
+        try:
+            if not self.distill.should_run_today():
+                return
+            proposals = self.distill.generate_proposals()
+            if not proposals:
+                # Record an empty round so we don't retry all day.
+                self.distill.record_round([])
+                return
+            self.distill.record_round(proposals)
+            rnd = self.distill.get_pending_round()
+            self._pending_km[session] = rnd
+            lines = [f"🔔 知识整理建议（{len(proposals)} 条）：", ""]
+            for i, p in enumerate(proposals, 1):
+                if p["kind"] == "alias":
+                    lines.append(f"{i}. 别名：{p['canonical']} ← {p['variant']}")
+                elif p["kind"] == "merge":
+                    lines.append(f"{i}. 合并：{p['reason']}")
+                else:
+                    lines.append(f"{i}. 关联：{p['reason']}")
+            lines.append("")
+            lines.append("回复 /km N 确认第 N 条；/km skip 忽略本轮")
+            await self.wx.send_text(session, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001 - background job must not crash
+            logger.error("daily distill failed: %s", exc, exc_info=True)
+
+    async def _km_loop(self) -> None:
+        """Run the daily distillation at ~03:00 local time, checking hourly."""
+        while True:
+            now = datetime.now()
+            target = now.replace(hour=3, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+            await self._distill_daily(self._home_session())
+
+    def _home_session(self) -> str:
+        """The chat to push proposals to (the only DM we know)."""
+        row = self.conn.execute(
+            "SELECT session FROM messages ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        return row["session"] if row else ""
+
+    async def _reply_km(self, message: Message, cmd: Command) -> None:
+        body = message.text.lstrip("/").strip()[2:].strip()
+        rnd = self._pending_km.get(message.session) or self.distill.get_pending_round()
+        if not rnd or not rnd["proposals"]:
+            await self._safe_reply(message.session, "当前没有待处理的知识整理建议")
+            return
+        self._pending_km[message.session] = rnd
+        proposals = rnd["proposals"]
+
+        if body in ("skip", "忽略"):
+            self.distill.set_round_status(rnd["round_id"], "skipped")
+            self._pending_km.pop(message.session, None)
+            await self._safe_reply(message.session, "✓ 已忽略本轮建议")
+            return
+
+        if body.isdigit() and 1 <= int(body) <= len(proposals):
+            p = self.distill.confirm_proposal(rnd["round_id"], int(body))
+            if p:
+                if p["kind"] == "alias":
+                    note = f"✓ 已记录别名：{p['canonical']} ← {p['variant']}（检索时自动生效）"
+                elif p["kind"] == "merge":
+                    note = "✓ 已记录合并关系（检索时自动生效）"
+                else:
+                    note = "✓ 已记录主题关联（检索时自动生效）"
+                await self._safe_reply(message.session, note)
+            else:
+                await self._safe_reply(message.session, "确认失败，建议已失效")
+            return
+
+        # No/invalid argument: show the current pending proposals.
+        lines = [f"🔔 待处理的知识整理建议（{len(proposals)} 条）：", ""]
+        for i, p in enumerate(proposals, 1):
+            if p["kind"] == "alias":
+                lines.append(f"{i}. 别名：{p['canonical']} ← {p['variant']}")
+            elif p["kind"] == "merge":
+                lines.append(f"{i}. 合并：{p['reason']}")
+            else:
+                lines.append(f"{i}. 关联：{p['reason']}")
+        lines.append("")
+        lines.append("回复 /km N 确认；/km skip 忽略本轮")
         await self.wx.send_text(message.session, "\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -247,7 +342,8 @@ class MemoryAgent:
             if llm_q is not None and (llm_q.keywords or llm_q.type_filter):
                 query = llm_q
 
-        hits = self.searcher.search(query)
+        hits = self.searcher.search(
+            query, expand_terms=self.distill.expansion_terms(query.keywords))
 
         # Zero-hit fallback: LLM picks from snapshot or rewrites the query.
         if not hits and raw_text:
@@ -369,10 +465,21 @@ class MemoryAgent:
                 return
         await self.wx.connect()
         logger.info("wechat-memory-agent started")
+        # Startup compensation: if today's knowledge consolidation has not
+        # run yet, do it now (covers days the machine was off).
+        try:
+            home = self._home_session()
+            if home:
+                await self._distill_daily(home)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("startup distill failed: %s", exc)
+        # Hourly scheduler: fires the daily consolidation at ~03:00.
+        km_task = asyncio.create_task(self._km_loop(), name="km-daily")
         try:
             while True:
                 await asyncio.sleep(3600)
         finally:
+            km_task.cancel()
             await self.wx.disconnect()
 
 
@@ -384,6 +491,7 @@ _HELP_TEXT = """\
   /1 删除  或 /del 1   删除上次结果中的第 1 条（7 天内可撤销）
   /undo             撤销最近一次删除
   /trash            查看回收站；/trash N 恢复第 N 条
+  /km               查看/确认知识整理建议（每日推送）
   /help             显示本帮助
 """
 

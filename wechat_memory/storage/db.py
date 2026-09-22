@@ -92,6 +92,29 @@ CREATE TABLE IF NOT EXISTS trash (
     deleted_at   TEXT NOT NULL,             -- ISO-8601
     snapshot     TEXT NOT NULL              -- JSON of all row data
 );
+
+-- Confirmed knowledge consolidation (DESIGN.md daily-merge design).
+-- Enriches retrieval only: raw data and documents rows are never touched,
+-- so any bad merge is reversible by deleting the row.
+CREATE TABLE IF NOT EXISTS knowledge_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,              -- merge | alias | link
+    canonical   TEXT NOT NULL DEFAULT '',   -- alias: the preferred term
+    variant     TEXT NOT NULL DEFAULT '',   -- alias: the alternative term
+    msg_ids     TEXT NOT NULL DEFAULT '[]', -- JSON list of related msg_ids
+    reason      TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kl_variant ON knowledge_links(variant);
+
+-- Daily merge proposals: pushed suggestions + their status, so the same
+-- proposal is not re-pushed every day.
+CREATE TABLE IF NOT EXISTS merge_proposals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposed_at TEXT NOT NULL,
+    payload     TEXT NOT NULL,              -- JSON of the proposal
+    status      TEXT NOT NULL DEFAULT 'pending'  -- pending|confirmed|skipped
+);
 """
 
 

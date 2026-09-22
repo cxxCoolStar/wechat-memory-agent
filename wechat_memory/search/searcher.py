@@ -31,8 +31,12 @@ class Searcher:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
 
-    def search(self, query: ParsedQuery, limit: int = 8) -> List[SearchHit]:
+    def search(self, query: ParsedQuery, limit: int = 8,
+               expand_terms: Optional[List[str]] = None) -> List[SearchHit]:
         """Execute the query.  Returns up to ``limit`` hits.
+
+        ``expand_terms``: alias terms confirmed via knowledge consolidation;
+        each broadens the metadata match (DESIGN.md daily-merge design).
 
         Strategy:
           1. Metadata FTS5 match (primary) — rank 0.
@@ -56,6 +60,16 @@ class Searcher:
         # for Chinese (FTS5 tokenizes poorly on CJK); FTS5 MATCH is a bonus.
         if query.keywords:
             like = f"%{query.keywords}%"
+            expand = expand_terms or []
+            # Alias expansion: each confirmed alias term gets its own LIKE arm.
+            expand_clauses = "".join(
+                " OR (d.title LIKE ? OR d.summary LIKE ? OR d.category LIKE ?)"
+                for _ in expand
+            )
+            expand_params: list = []
+            for term in expand:
+                t = f"%{term}%"
+                expand_params += [t, t, t]
             sql = (
                 "SELECT m.msg_id, m.timestamp, m.message_type, m.raw_dir, "
                 "       m.text, d.title, d.summary "
@@ -71,6 +85,7 @@ class Searcher:
                 "                  fts_metadata MATCH ?)"
                 "  OR m.msg_id IN (SELECT msg_id FROM fts_fulltext WHERE "
                 "                  fts_fulltext MATCH ?)"
+                + expand_clauses +
                 ") "
                 "ORDER BY "
                 "  CASE WHEN (d.title LIKE ? OR d.summary LIKE ? OR d.category LIKE ?) "
@@ -81,6 +96,7 @@ class Searcher:
             params2 = (
                 params
                 + [like, like, like, like, like, fts_keyword, fts_keyword]
+                + expand_params
                 + [like, like, like, limit]
             )
             rows = self._conn.execute(sql, params2).fetchall()
