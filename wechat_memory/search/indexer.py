@@ -5,8 +5,8 @@ A separate module from storage/db.py so indexing concerns stay isolated.
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from typing import Optional
 
 
 class Indexer:
@@ -18,17 +18,51 @@ class Indexer:
     def index_message(self, msg_id: str) -> None:
         """Build/refresh FTS rows for one message.
 
-        - fts_metadata: one row joining documents.metadata for this msg.
-        - fts_fulltext: one row joining attachments.extracted_text + messages.text.
+        - fts_metadata: one row per attachment's documents.metadata.
+        - fts_fulltext: one row per attachment's extracted_text + msg text.
         """
-        # TODO(impl): INSERT INTO fts_metadata(msg_id, title, summary, category, keywords)
-        #   SELECT ... FROM documents JOIN attachments WHERE msg_id = ?
-        #   INSERT INTO fts_fulltext(msg_id, body)
-        #   SELECT msg_id, text || extracted_text ... FROM messages JOIN attachments
-        raise NotImplementedError
+        conn = self._conn
+        # Remove any existing rows first (idempotent reindex).
+        self.remove_message(msg_id)
+
+        # Metadata FTS: title/summary/category/keywords per attachment.
+        rows = conn.execute(
+            """SELECT d.title, d.summary, d.category, d.keywords
+               FROM documents d JOIN attachments a ON d.attach_id = a.id
+               WHERE d.msg_id = ?""",
+            (msg_id,),
+        ).fetchall()
+        for row in rows:
+            keywords = row["keywords"]
+            if keywords:
+                try:
+                    keywords = " ".join(json.loads(keywords))
+                except json.JSONDecodeError:
+                    keywords = str(keywords)
+            conn.execute(
+                "INSERT INTO fts_metadata (msg_id, title, summary, category, keywords) "
+                "VALUES (?,?,?,?,?)",
+                (msg_id, row["title"], row["summary"], row["category"], keywords),
+            )
+
+        # Fulltext FTS: message text + each attachment's extracted text.
+        body_parts = []
+        m = conn.execute("SELECT text FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
+        if m and m["text"]:
+            body_parts.append(m["text"])
+        att_rows = conn.execute(
+            "SELECT extracted_text FROM attachments WHERE msg_id = ?", (msg_id,)
+        ).fetchall()
+        for a in att_rows:
+            if a["extracted_text"]:
+                body_parts.append(a["extracted_text"])
+        body = "\n".join(body_parts)
+        if body:
+            conn.execute(
+                "INSERT INTO fts_fulltext (msg_id, body) VALUES (?,?)", (msg_id, body)
+            )
 
     def remove_message(self, msg_id: str) -> None:
-        """Delete FTS rows for a removed message."""
-        # TODO(impl): DELETE FROM fts_metadata WHERE msg_id = ?
-        #   DELETE FROM fts_fulltext WHERE msg_id = ?
-        raise NotImplementedError
+        conn = self._conn
+        conn.execute("DELETE FROM fts_metadata WHERE msg_id = ?", (msg_id,))
+        conn.execute("DELETE FROM fts_fulltext WHERE msg_id = ?", (msg_id,))

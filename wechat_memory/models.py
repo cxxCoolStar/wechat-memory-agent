@@ -133,6 +133,7 @@ class Message:
     message_type: str               # level-1 type
     raw_dir: str                    # path to this message's raw directory
     text: str = ""                  # extracted text content (if any)
+    text_metadata: Optional["ItemMetadata"] = None  # LLM metadata for pure-text messages
     attachments: List[Attachment] = field(default_factory=list)
     invoice: Optional[InvoiceData] = None
     raw_message: Dict[str, Any] = field(default_factory=dict)  # original WeChat structure

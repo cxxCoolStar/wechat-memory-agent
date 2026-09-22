@@ -1,0 +1,21 @@
+# WeChat iLink connection
+aiohttp>=3.9
+cryptography>=42
+qrcode>=7.4
+
+# Extraction
+pymupdf>=1.24
+python-docx>=1.1
+openpyxl>=3.1
+rapidocr-onnxruntime>=1.4
+
+# Link snapshot
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5
+
+# Config
+python-dotenv>=1.0
+
+# LLM metadata (OpenAI-compatible)
+openai>=1.30

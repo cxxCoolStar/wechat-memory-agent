@@ -21,6 +21,7 @@ class ParsedQuery:
     time_from: Optional[datetime] = None
     time_to: Optional[datetime] = None
     raw_text: str = ""
+    parsed_by_llm: bool = False       # True when produced by the LLM fallback
 
     def describe(self) -> str:
         parts = []
@@ -78,11 +79,19 @@ def parse_query(raw_text: str, cfg: Config) -> ParsedQuery:
 
     # Keywords: strip common framing words, keep the rest.
     cleaned = re.sub(r"^[/\s]*", "", raw_text)
-    cleaned = re.sub(r"帮我(查|找|搜索|搜)?(一下|一)?", "", cleaned)
-    cleaned = re.sub(r"(最近|上周|上个月|昨天|本月|本周).{0,6}", "", cleaned)
+    # 框架词/语气词
+    cleaned = re.sub(r"(帮我|帮我查|查一下|找一下|搜索一下|搜一下|找找|看看|查询)(的)?", "", cleaned)
+    cleaned = re.sub(r"(我|你|他|她)(上传|发的|发过|保存|存过|保存过)?(的|了)?", "", cleaned)
+    # 时间短语（含"刚才/上次"这类相对时间）
+    cleaned = re.sub(r"(最近|最近一个月|近一个月|上周|上个月|昨天|本月|本周|刚才|上次|之前|以前|一个月内|一个月)", "", cleaned)
+    # 量词/助词/语气词
+    cleaned = re.sub(r"(一个|这个|那个|一下|的|了|一条|那个|有没有)", "", cleaned)
     # Remove type words that were consumed.
     for word in cfg.type_word_map:
         cleaned = cleaned.replace(word, "")
     cleaned = cleaned.strip(" ，。、")
+    # If nothing meaningful remains, treat as "no keyword" (type/time-only search).
+    if cleaned in {"", "发", "找", "查", "看", "有", "上"} or len(cleaned) <= 1:
+        cleaned = ""
     q.keywords = cleaned
     return q

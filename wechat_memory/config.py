@@ -85,7 +85,9 @@ def _load_type_word_map() -> dict:
     return {
         "压缩包": "binary", "zip": "binary", "rar": "binary",
         "发票": "invoice",
-        "截图": "image", "图片": "image", "图": "image", "照片": "image",
+        # Note: avoid single-char "图" here — it would misfire on queries
+        # like "图记忆/图书馆/地图". Use explicit words only.
+        "截图": "image", "图片": "image", "照片": "image",
         "文档": "document", "pdf": "document", "word": "document", "excel": "document",
         "链接": "link", "网址": "link", "url": "link",
     }
