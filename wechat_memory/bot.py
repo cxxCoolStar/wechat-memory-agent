@@ -136,10 +136,34 @@ class MemoryAgent:
             await self._reply_undo(message)
         elif cmd.name == "trash":
             await self._reply_trash(message, cmd)
+        elif cmd.name in ("all", "list"):
+            await self._reply_all(message)
         elif cmd.name == "help":
             await self.wx.send_text(message.session, _HELP_TEXT)
         else:
             await self.wx.send_text(message.session, f"未知指令: {cmd.raw}")
+
+    # ------------------------------------------------------------------
+    async def _reply_all(self, message: Message) -> None:
+        """/all (or /list): show every archived record, newest first.
+
+        Uses the same card list as inventory queries so /N pick, /N 删除
+        and /del N all work against this listing.
+        """
+        from .search.query_parser import ParsedQuery
+        hits = self.searcher.search(ParsedQuery(action="list"), limit=50)
+        if not hits:
+            await self.wx.send_text(message.session, "📭 知识库还是空的，先给它发点内容吧")
+            return
+        _last_results[message.session] = [h.msg_id for h in hits]
+        lines = [f"📭 全部记录（共 {len(hits)} 条，最近优先）：", ""]
+        for i, h in enumerate(hits, 1):
+            icon = _TYPE_ICON.get(h.message_type, "❓")
+            title = h.title or "(无标题)"
+            lines.append(f"{i}. {icon} {h.timestamp:%m-%d} | {title[:40]}")
+        lines.append("")
+        lines.append("回复 /1 /2 ... 查看详情并取回原文件；/N 删除 删除某条")
+        await self.wx.send_text(message.session, "\n".join(lines))
 
     # ------------------------------------------------------------------
     async def _reply_delete(self, message: Message, cmd: Command) -> None:
@@ -355,11 +379,11 @@ class MemoryAgent:
 _HELP_TEXT = """\
 可用指令：
   / <你想找的内容>  自然语言检索，如：/帮我查最近一个月的压缩包
+  /all 或 /list     显示全部记录列表
   /1 /2 ...         选择上一条搜索结果中的某条，回传原文件
   /1 删除  或 /del 1   删除上次结果中的第 1 条（7 天内可撤销）
   /undo             撤销最近一次删除
   /trash            查看回收站；/trash N 恢复第 N 条
-  /list             浏览最近记录
   /help             显示本帮助
 """
 

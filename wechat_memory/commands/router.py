@@ -24,7 +24,7 @@ class Command:
 class CommandRouter:
     """Decides what a slash command means and builds a Command."""
 
-    _FIXED = {"help", "list", "stats", "delete", "undo", "trash"}
+    _FIXED = {"help", "list", "all", "stats", "delete", "undo", "trash"}
 
     def __init__(self, cfg: Config):
         self._cfg = cfg

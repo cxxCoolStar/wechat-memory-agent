@@ -130,3 +130,13 @@ class TestTimeParsing:
     def test_no_time(self, cfg):
         q = parse_query("/T-Mem", cfg)
         assert q.time_from is None
+
+
+class TestAllCommand:
+    """/all lists every record (router maps it to the 'all' fixed command)."""
+
+    def test_router_routes_all(self):
+        from wechat_memory.commands.router import CommandRouter
+        r = CommandRouter(cfg)
+        for text in ("/all", "/ALL", "/list"):
+            assert r.route(text).name in ("all", "list")
