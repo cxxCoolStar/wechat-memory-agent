@@ -22,9 +22,12 @@ class ParsedQuery:
     time_to: Optional[datetime] = None
     raw_text: str = ""
     parsed_by_llm: bool = False       # True when produced by the LLM fallback
+    action: str = "search"            # "search" | "list" (browse/inventory)
 
     def describe(self) -> str:
         parts = []
+        if self.action == "list":
+            parts.append("浏览记录")
         if self.type_filter:
             parts.append(f"类型={self.type_filter}")
         if self.time_from:
@@ -64,10 +67,40 @@ def _parse_type(text: str, type_word_map: dict) -> Optional[str]:
     return None
 
 
+# --- Inventory/browse intent ----------------------------------------------
+# "保存了哪些文件"/"有哪些内容" are browse requests, not keyword
+# searches — they should list recent records (optionally type/time-filtered).
+# A bare type word ("发票") must NOT trigger this — "哪些/什么" (or an
+# explicit browse verb) is what makes it an inventory request.
+_LIST_INTENT_RE = re.compile(
+    r"(保存|存|收)了?(哪些|什么|啥|那些)"
+    r"|(有哪些|有哪些|哪些|什么|啥)(文件|内容|东西|记录|资料"
+    r"|pdf|docx|xlsx|word|excel|图片|照片|截图|链接|网址|压缩包|zip|rar|发票)"
+    r"|列出|清单|盘点|库存|目录",
+    re.IGNORECASE,
+)
+
+
+def is_list_intent(text: str) -> bool:
+    return bool(_LIST_INTENT_RE.search(text))
+
+
 def parse_query(raw_text: str, cfg: Config) -> ParsedQuery:
     """Rule-based parse.  Returns a ParsedQuery; caller may fall back to LLM
     when this yields nothing useful."""
     q = ParsedQuery(raw_text=raw_text)
+
+    # Inventory intent: "保存了哪些文件"/"有哪些内容" — browse, not search.
+    if is_list_intent(raw_text):
+        q.action = "list"
+        # Time/type filters still apply ("保存了哪些PDF" is meaningful);
+        # only the intent words themselves must not become keywords.
+        q.time_from = None
+        delta = _parse_time(raw_text)
+        if delta:
+            q.time_from = datetime.now() - delta
+        q.type_filter = _parse_type(raw_text, cfg.type_word_map)
+        return q
 
     # Time.
     delta = _parse_time(raw_text)

@@ -7,7 +7,7 @@ worth OCR'ing (screenshot-like) or is a photo (metadata only).
 from __future__ import annotations
 
 from ..models import (
-    BINARY, BIN_ARCHIVE, BIN_EXE, BIN_JAR, BIN_UNKNOWN,
+    BINARY, BIN_ARCHIVE, BIN_EXE, BIN_JAR,
     DOCUMENT, DOC_DOCX, DOC_PDF, DOC_XLSX,
     IMAGE, IMG_PHOTO, IMG_SCREENSHOT, INVOICE, LINK, OTHER, TEXT,
 )
@@ -22,7 +22,6 @@ _SUBTYPE_TO_LEVEL1 = {
     BIN_JAR: BINARY,
     BIN_EXE: BINARY,
     BIN_ARCHIVE: BINARY,
-    BIN_UNKNOWN: BINARY,
 }
 
 

@@ -84,6 +84,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_metadata USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_fulltext USING fts5(
     msg_id UNINDEXED, body
 );
+
+-- Soft-delete registry: full row snapshots so /undo can restore exactly.
+CREATE TABLE IF NOT EXISTS trash (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id       TEXT NOT NULL UNIQUE,
+    deleted_at   TEXT NOT NULL,             -- ISO-8601
+    snapshot     TEXT NOT NULL              -- JSON of all row data
+);
 """
 
 

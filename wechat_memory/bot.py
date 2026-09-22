@@ -17,8 +17,11 @@ from .commands.router import Command, CommandRouter
 from .config import Config, load_config
 from .ingest.pipeline import IngestPipeline
 from .models import Message
+from .search import llm_fallback as llm_fb
+from .search.query_parser import parse_query
 from .search.searcher import SearchHit, Searcher
 from .storage.db import connect
+from .storage.trash import TrashManager
 from .weixin.client import WeixinClient
 
 logger = logging.getLogger(__name__)
@@ -32,8 +35,10 @@ _TYPE_ICON = {
 }
 
 # Session state: remember the last search results per chat for /<n> picks.
-# {session: [(msg_id, label), ...]}
+# {session: [msg_id, ...]}
 _last_results: Dict[str, List[str]] = {}
+# Trash listing per chat for /trash N restore.  {session: [entry, ...]}
+_trash_listings: Dict[str, list] = {}
 
 
 class MemoryAgent:
@@ -45,6 +50,8 @@ class MemoryAgent:
         self.router = CommandRouter(self.cfg)
         self.pipeline = IngestPipeline(self.cfg, self.conn)
         self.searcher = Searcher(self.conn)
+        self.history = llm_fb.ConversationHistory()
+        self.trash = TrashManager(self.cfg, self.conn)
         self.wx = WeixinClient(self.cfg)
 
     # -- wiring ------------------------------------------------------------
@@ -123,24 +130,128 @@ class MemoryAgent:
             await self._reply_search(message, cmd)
         elif cmd.name == "pick":
             await self._reply_pick(message, cmd)
+        elif cmd.name == "delete":
+            await self._reply_delete(message, cmd)
+        elif cmd.name == "undo":
+            await self._reply_undo(message)
+        elif cmd.name == "trash":
+            await self._reply_trash(message, cmd)
         elif cmd.name == "help":
             await self.wx.send_text(message.session, _HELP_TEXT)
         else:
             await self.wx.send_text(message.session, f"未知指令: {cmd.raw}")
 
     # ------------------------------------------------------------------
-    async def _reply_search(self, message: Message, cmd: Command) -> None:
-        if cmd.query is None:
-            await self.wx.send_text(message.session, "没理解你的查询，试试 /help")
+    async def _reply_delete(self, message: Message, cmd: Command) -> None:
+        results = _last_results.get(message.session, [])
+        if cmd.pick_index is None or cmd.pick_index < 1 or cmd.pick_index > len(results):
+            await self.wx.send_text(
+                message.session, "没有这个条目，请先 /搜索 再选择，或用 /help")
             return
-        hits = self.searcher.search(cmd.query)
+        msg_id = results[cmd.pick_index - 1]
+        if self.trash.soft_delete(msg_id):
+            results.pop(cmd.pick_index - 1)
+            await self._safe_reply(message.session,
+                                   f"🗑 已删除（7 天内可用 /undo 撤销）")
+        else:
+            await self._safe_reply(message.session, "该记录已不存在")
+
+    async def _reply_undo(self, message: Message) -> None:
+        msg_id = self.trash.undo_last()
+        if msg_id:
+            await self._safe_reply(message.session, f"✓ 已恢复 {msg_id}")
+        else:
+            await self._safe_reply(message.session, "回收站为空，没有可恢复的记录")
+
+    async def _reply_trash(self, message: Message, cmd: Command) -> None:
+        entries = self.trash.list_entries()
+        if not entries:
+            await self._safe_reply(message.session, "🗑 回收站为空")
+            return
+        _trash_listings[message.session] = entries
+        lines = [f"🗑 回收站 {len(entries)} 条（7 天后自动清除）：", ""]
+        for i, e in enumerate(entries, 1):
+            title = e["title"] or "(无标题)"
+            lines.append(f"{i}. {e['deleted_at'][:10]} | {title[:36]}")
+        lines.append("")
+        lines.append("回复 /trash N 恢复第 N 条；/undo 恢复最近一条")
+        await self.wx.send_text(message.session, "\n".join(lines))
+
+        # /trash N -> restore entry N
+        rest = message.text.lstrip("/").strip().split(maxsplit=1)
+        if len(rest) > 1 and rest[1].strip().isdigit():
+            idx = int(rest[1].strip())
+            msg_id = self.trash.undo_by_index(
+                idx, _trash_listings.get(message.session, []))
+            if msg_id:
+                await self._safe_reply(message.session, f"✓ 已恢复 {msg_id}")
+            else:
+                await self._safe_reply(message.session, "恢复失败，条目不存在")
+
+    # ------------------------------------------------------------------
+    async def _reply_search(self, message: Message, cmd: Command) -> None:
+        raw_text = message.text.lstrip().lstrip("/").strip()
+
+        # Layer 1: rule parse.
+        query = cmd.query or parse_query(raw_text, self.cfg)
+
+        # Inventory intent ("保存了哪些文件"): browse recent records with
+        # optional type/time filters — no keyword search involved.
+        if query.action == "list":
+            hits = self.searcher.search(query, limit=20)
+            if not hits:
+                await self.wx.send_text(
+                    message.session,
+                    f"📭 目前还没有{('该类型' if query.type_filter else '')}的记录",
+                )
+                return
+            _last_results[message.session] = [h.msg_id for h in hits]
+            lines = [f"📭 共 {len(hits)} 条记录（最近优先）：", ""]
+            for i, h in enumerate(hits, 1):
+                icon = _TYPE_ICON.get(h.message_type, "❓")
+                title = h.title or "(无标题)"
+                lines.append(f"{i}. {icon} {h.timestamp:%m-%d} | {title[:40]}")
+            lines.append("")
+            lines.append("回复 /1 /2 ... 查看详情并取回原文件")
+            await self.wx.send_text(message.session, "\n".join(lines))
+            return
+
+        # Layer 2: LLM parse when rules couldn't handle it (anaphora or empty).
+        if (not query.keywords and not query.type_filter and not query.time_from) \
+                or llm_fb.has_anaphora(raw_text):
+            llm_q = llm_fb.llm_parse_query(self.cfg, raw_text, self.history)
+            if llm_q is not None and (llm_q.keywords or llm_q.type_filter):
+                query = llm_q
+
+        hits = self.searcher.search(query)
+
+        # Zero-hit fallback: LLM picks from snapshot or rewrites the query.
+        if not hits and raw_text:
+            snapshot = llm_fb.build_kb_snapshot(self.conn)
+            rw = llm_fb.llm_rewrite_zero_hit(self.cfg, raw_text, self.history,
+                                             snapshot)
+            if rw is not None:
+                if rw.match_id:
+                    detail = self.searcher.get_detail(rw.match_id)
+                    if detail is not None:
+                        hits = [self._hit_from_detail(detail)]
+                elif rw.rewritten is not None:
+                    hits = self.searcher.search(rw.rewritten)
+                    if hits:
+                        query = rw.rewritten
+
         if not hits:
             await self.wx.send_text(
                 message.session,
-                f"🔍 没有找到匹配的记录（条件: {cmd.query.describe()}）",
+                f"🔍 没有找到匹配的记录（条件: {query.describe()}）",
             )
+            self.history.record(raw_text, query.describe(), [])
             return
+
+        # Record this round (for next query's anaphora resolution).
+        self.history.record(raw_text, query.describe(), [h.title for h in hits])
         _last_results[message.session] = [h.msg_id for h in hits]
+
         lines = [f"🔍 找到 {len(hits)} 条相关记录：", ""]
         for i, h in enumerate(hits, 1):
             icon = _TYPE_ICON.get(h.message_type, "❓")
@@ -152,6 +263,25 @@ class MemoryAgent:
             lines.append("")
         lines.append("回复 /1 /2 ... 查看详情并取回原文件")
         await self.wx.send_text(message.session, "\n".join(lines))
+
+    def _hit_from_detail(self, detail: dict) -> SearchHit:
+        """Build a SearchHit from get_detail() output (LLM direct pick)."""
+        m = detail["message"]
+        docs = detail["documents"]
+        title = docs[0]["title"] if docs and docs[0]["title"] else ""
+        summary = docs[0]["summary"] if docs and docs[0]["summary"] else ""
+        ts = m["timestamp"]
+        try:
+            from datetime import datetime
+            ts_dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            from datetime import datetime
+            ts_dt = datetime.now()
+        return SearchHit(
+            msg_id=m["msg_id"], timestamp=ts_dt,
+            message_type=m["message_type"], title=title, summary=summary,
+            match_reason="近似匹配（LLM）", raw_dir=m["raw_dir"],
+        )
 
     async def _reply_pick(self, message: Message, cmd: Command) -> None:
         results = _last_results.get(message.session, [])
@@ -165,7 +295,8 @@ class MemoryAgent:
             await self.wx.send_text(message.session, "该记录已不存在")
             return
         m = detail["message"]
-        lines = [f"📄 {m['msg_id']}", f"时间: {m['timestamp']}",
+        type_icon = _TYPE_ICON.get(m["message_type"], "❓")
+        lines = [f"{type_icon} {m['msg_id']}", f"时间: {m['timestamp']}",
                  f"类型: {m['message_type']}", ""]
         docs = detail["documents"]
         if docs:
@@ -182,7 +313,14 @@ class MemoryAgent:
                          f"{inv['invoice_date']}")
         await self.wx.send_text(message.session, "\n".join(lines))
 
-        # Send back original files, if any.
+        # Send back originals: link attachments get their URL (from the
+        # links table), file attachments get the raw file.
+        links = self.conn.execute(
+            "SELECT url FROM links WHERE msg_id = ?", (msg_id,)
+        ).fetchall()
+        for l in links:
+            if l["url"]:
+                await self._safe_reply(message.session, l["url"])
         for att in detail["attachments"]:
             if not att["filename"]:
                 continue
@@ -195,6 +333,10 @@ class MemoryAgent:
     # ------------------------------------------------------------------
     async def run(self) -> None:
         self._wire()
+        # Purge trash entries older than the retention window.
+        purged = self.trash.purge_expired()
+        if purged:
+            logger.info("purged %d expired trash entries at startup", purged)
         if not self.wx.has_credentials():
             logger.info("no Weixin credentials; starting QR login...")
             creds = await self.wx.qr_login()
@@ -214,6 +356,10 @@ _HELP_TEXT = """\
 可用指令：
   / <你想找的内容>  自然语言检索，如：/帮我查最近一个月的压缩包
   /1 /2 ...         选择上一条搜索结果中的某条，回传原文件
+  /1 删除  或 /del 1   删除上次结果中的第 1 条（7 天内可撤销）
+  /undo             撤销最近一次删除
+  /trash            查看回收站；/trash N 恢复第 N 条
+  /list             浏览最近记录
   /help             显示本帮助
 """
 
