@@ -111,3 +111,15 @@ class TestFakeFiles:
             zf.writestr("[Content_Types].xml", "<Types/>")
             zf.writestr("xl/workbook.xml", "<wb/>")
         assert detect_type(p) == "xlsx"
+
+
+class TestVoiceSilk:
+    """WeChat voice messages arrive as silk audio (#!SILK magic)."""
+
+    def test_silk_magic(self, tmp_path):
+        p = tmp_path / "v.silk"
+        p.write_bytes(b"#!SILK_V3" + b"\x00" * 32)
+        assert detect_type(p) == "voice"
+
+    def test_voice_is_binary_level1(self):
+        assert subtype_to_level1("voice") == "binary"

@@ -24,6 +24,7 @@ _MAGIC = [
     (b"%PDF", "pdf", False),
     (b"\xff\xd8\xff", "screenshot", False),  # JPEG
     (b"\x89PNG", "screenshot", False),        # PNG
+    (b"#!SILK", "voice", False),              # WeChat voice (silk audio)
     (b"PK", None, True),                      # zip container -> inspect further
     (b"MZ", "exe", False),                    # PE/exe/dll
     (b"Rar!", "archive", False),
@@ -56,7 +57,7 @@ def detect_type(path: Path) -> str:
     magic_hit = None
     try:
         with open(path, "rb") as f:
-            head = f.read(4)
+            head = f.read(8)  # longest signature is 6 bytes (#!SILK); read 8
     except OSError:
         return "unknown"
 

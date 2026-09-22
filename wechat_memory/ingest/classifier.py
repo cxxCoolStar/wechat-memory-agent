@@ -22,6 +22,7 @@ _SUBTYPE_TO_LEVEL1 = {
     BIN_JAR: BINARY,
     BIN_EXE: BINARY,
     BIN_ARCHIVE: BINARY,
+    "voice": BINARY,   # silk audio: archived, no STT yet (DESIGN.md §2.2)
 }
 
 

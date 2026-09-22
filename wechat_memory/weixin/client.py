@@ -40,6 +40,7 @@ ILINK_APP_CLIENT_VERSION = (2 << 16) | (2 << 8) | 0
 EP_GET_UPDATES = "ilink/bot/getupdates"
 EP_SEND_MESSAGE = "ilink/bot/sendmessage"
 EP_SEND_TYPING = "ilink/bot/sendtyping"
+EP_GET_UPLOAD_URL = "ilink/bot/getuploadurl"
 EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
 
@@ -51,6 +52,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY_SECONDS = 2
 BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
+SESSION_EXPIRED_RELOGIN_AFTER = 3  # -14 count before advising a fresh QR login
 RATE_LIMIT_ERRCODE = -2
 
 # item_list types
@@ -63,6 +65,12 @@ ITEM_VIDEO = 5
 # message types
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
+
+# upload media types (getuploadurl)
+MEDIA_IMAGE = 1
+MEDIA_VIDEO = 2
+MEDIA_FILE = 3
+MEDIA_VOICE = 4
 
 _WEIXIN_CDN_ALLOWLIST = frozenset(
     {
@@ -123,6 +131,15 @@ def _sync_buf_path(data_home: Path, account_id: str) -> Path:
 def _cdn_download_url(cdn_base_url: str, encrypted_query_param: str) -> str:
     from urllib.parse import quote
     return f"{cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
+
+
+def _cdn_upload_url(cdn_base_url: str, upload_param: str, filekey: str) -> str:
+    from urllib.parse import quote
+    return (
+        f"{cdn_base_url.rstrip('/')}/upload"
+        f"?encrypted_query_param={quote(upload_param, safe='')}"
+        f"&filekey={quote(filekey, safe='')}"
+    )
 
 
 def _assert_weixin_cdn_url(url: str) -> None:
@@ -195,6 +212,7 @@ class WeixinClient:
         self._poll_task: Optional[asyncio.Task] = None
         self._running = False
         self._sync_buf = ""
+        self._expired_count = 0
         self._on_message: Optional[Callable[[Message], None]] = None
 
         self._account_id = cfg.wx_account_id
@@ -486,12 +504,28 @@ class WeixinClient:
                 errcode = resp.get("errcode", 0)
 
                 if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
-                    logger.warning("weixin session expired; sleeping 600s")
+                    self._expired_count += 1
                     consecutive_failures = 0
+                    if self._expired_count == 1:
+                        logger.warning(
+                            "weixin session expired; sleeping 600s before retry")
+                    elif self._expired_count == SESSION_EXPIRED_RELOGIN_AFTER:
+                        logger.error(
+                            "weixin session expired %d times in a row — the bot "
+                            "token is very likely dead.  Restart "
+                            "`python scripts/run.py` after deleting the "
+                            "WEIXIN_* lines from .env to scan a fresh QR code.",
+                            self._expired_count,
+                        )
+                    else:
+                        logger.warning(
+                            "weixin session still expired (attempt %d); sleeping 600s",
+                            self._expired_count)
                     await asyncio.sleep(600)
                     continue
 
                 if ret != 0 or errcode != 0:
+                    self._expired_count = 0
                     consecutive_failures += 1
                     delay = (RETRY_DELAY_SECONDS if consecutive_failures
                              < MAX_CONSECUTIVE_FAILURES else BACKOFF_DELAY_SECONDS)
@@ -501,6 +535,7 @@ class WeixinClient:
                     continue
 
                 consecutive_failures = 0
+                self._expired_count = 0
                 new_buf = str(resp.get("get_updates_buf") or "")
                 if new_buf:
                     self._sync_buf = new_buf
@@ -697,6 +732,117 @@ class WeixinClient:
         }
         await self._api_post(EP_SEND_MESSAGE, {"msg": message},
                              token=self._token, timeout_ms=API_TIMEOUT_MS)
+
+    @staticmethod
+    def _outbound_media_item(path: str, encrypt_query_param: str,
+                             aes_key_for_api: str, ciphertext_size: int,
+                             plaintext_size: int, filename: str,
+                             rawfilemd5: str) -> Dict[str, Any]:
+        """Build the item_list entry for an outbound media file."""
+        import mimetypes
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        media = {
+            "encrypt_query_param": encrypt_query_param,
+            "aes_key": aes_key_for_api,
+            "encrypt_type": 1,
+        }
+        if mime.startswith("image/"):
+            return {"type": ITEM_IMAGE,
+                    "image_item": {"media": media, "mid_size": ciphertext_size}}
+        if mime.startswith("video/"):
+            return {"type": ITEM_VIDEO,
+                    "video_item": {"media": media, "video_size": ciphertext_size,
+                                   "video_md5": rawfilemd5}}
+        return {"type": ITEM_FILE,
+                "file_item": {"media": media, "file_name": filename,
+                              "len": str(plaintext_size)}}
+
+    async def send_file(self, chat_id: str, path: str) -> None:
+        """Send a local file back to the user (image/video/generic file).
+
+        Flow mirrors hermes _send_file: getuploadurl -> AES-128-ECB encrypt
+        -> CDN upload (ciphertext as POST body) -> sendmessage with the
+        media item.  The iLink API expects the AES key as base64(hex_string).
+        """
+        import hashlib
+        import mimetypes
+        import secrets
+
+        plaintext = Path(path).read_bytes()
+        filekey = secrets.token_hex(16)
+        aes_key = secrets.token_bytes(16)
+        rawsize = len(plaintext)
+        rawfilemd5 = hashlib.md5(plaintext).hexdigest()
+
+        upload_resp = await self._api_post(
+            EP_GET_UPLOAD_URL,
+            payload={
+                "filekey": filekey,
+                "media_type": MEDIA_FILE,
+                "to_user_id": chat_id,
+                "rawsize": rawsize,
+                "rawfilemd5": rawfilemd5,
+                "filesize": crypto.aes_padded_size(rawsize),
+                "no_need_thumb": True,
+                "aeskey": aes_key.hex(),
+            },
+            token=self._token,
+            timeout_ms=API_TIMEOUT_MS,
+        )
+        upload_param = str(upload_resp.get("upload_param") or "")
+        upload_full_url = str(upload_resp.get("upload_full_url") or "")
+        if upload_full_url:
+            upload_url = upload_full_url
+        elif upload_param:
+            upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
+        else:
+            raise RuntimeError(
+                f"getUploadUrl returned neither upload_param nor upload_full_url: "
+                f"{upload_resp}")
+
+        ciphertext = crypto.aes128_ecb_encrypt(plaintext, aes_key)
+        encrypted_query_param = await self._upload_ciphertext(ciphertext, upload_url)
+
+        # base64(hex_string), NOT base64(raw bytes) — mismatch shows as grey boxes.
+        aes_key_for_api = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
+        media_item = self._outbound_media_item(
+            path, encrypted_query_param, aes_key_for_api,
+            len(ciphertext), rawsize, Path(path).name, rawfilemd5,
+        )
+        message = {
+            "from_user_id": "",
+            "to_user_id": chat_id,
+            "client_id": f"wma-{uuid.uuid4().hex}",
+            "message_type": MSG_TYPE_BOT,
+            "message_state": MSG_STATE_FINISH,
+            "item_list": [media_item],
+        }
+        await self._api_post(EP_SEND_MESSAGE, {"msg": message},
+                             token=self._token, timeout_ms=API_TIMEOUT_MS)
+
+    async def _upload_ciphertext(self, ciphertext: bytes, upload_url: str) -> str:
+        """POST ciphertext to the CDN; the response header carries the
+        download credential."""
+        assert self._session is not None
+
+        async def _do() -> str:
+            async with self._session.post(
+                upload_url, data=ciphertext,
+                headers={"Content-Type": "application/octet-stream"},
+            ) as resp:
+                if resp.status != 200:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        f"CDN upload HTTP {resp.status}: {raw[:200]}")
+                encrypted_param = resp.headers.get("x-encrypted-param")
+                if not encrypted_param:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        f"CDN upload missing x-encrypted-param: {raw[:200]}")
+                await resp.read()
+                return encrypted_param
+
+        return await asyncio.wait_for(_do(), timeout=120)
 
     # ------------------------------------------------------------------
     # callback
