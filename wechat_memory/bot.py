@@ -43,6 +43,18 @@ _last_results: Dict[str, List[str]] = {}
 _trash_listings: Dict[str, list] = {}
 
 
+def _proposal_label(p: dict) -> str:
+    """One-line human-readable label for a merge proposal."""
+    kind = p.get("kind")
+    if kind == "alias":
+        return f"别名：{p['canonical']} ← {p['variant']}"
+    if kind == "version_of":
+        return f"版本关系：{p.get('reason', 'B 是 A 的更新版本')}"
+    if kind == "duplicate":
+        return f"重复：{p.get('reason', '内容相同的重复条目')}"
+    return f"关联：{p.get('reason', '同一主题')}"
+
+
 class MemoryAgent:
     """Top-level application object."""
 
@@ -189,12 +201,7 @@ class MemoryAgent:
             self._pending_km[session] = rnd
             lines = [f"🔔 知识整理建议（{len(proposals)} 条）：", ""]
             for i, p in enumerate(proposals, 1):
-                if p["kind"] == "alias":
-                    lines.append(f"{i}. 别名：{p['canonical']} ← {p['variant']}")
-                elif p["kind"] == "merge":
-                    lines.append(f"{i}. 合并：{p['reason']}")
-                else:
-                    lines.append(f"{i}. 关联：{p['reason']}")
+                lines.append(f"{i}. {_proposal_label(p)}")
             lines.append("")
             lines.append("回复 /km N 确认第 N 条；/km skip 忽略本轮")
             await self.wx.send_text(session, "\n".join(lines))
@@ -238,8 +245,10 @@ class MemoryAgent:
             if p:
                 if p["kind"] == "alias":
                     note = f"✓ 已记录别名：{p['canonical']} ← {p['variant']}（检索时自动生效）"
-                elif p["kind"] == "merge":
-                    note = "✓ 已记录合并关系（检索时自动生效）"
+                elif p["kind"] == "version_of":
+                    note = "✓ 已记录版本链（检索时会标注最新版）"
+                elif p["kind"] == "duplicate":
+                    note = "✓ 已记录重复关系（检索时自动生效）"
                 else:
                     note = "✓ 已记录主题关联（检索时自动生效）"
                 await self._safe_reply(message.session, note)
@@ -250,12 +259,7 @@ class MemoryAgent:
         # No/invalid argument: show the current pending proposals.
         lines = [f"🔔 待处理的知识整理建议（{len(proposals)} 条）：", ""]
         for i, p in enumerate(proposals, 1):
-            if p["kind"] == "alias":
-                lines.append(f"{i}. 别名：{p['canonical']} ← {p['variant']}")
-            elif p["kind"] == "merge":
-                lines.append(f"{i}. 合并：{p['reason']}")
-            else:
-                lines.append(f"{i}. 关联：{p['reason']}")
+            lines.append(f"{i}. {_proposal_label(p)}")
         lines.append("")
         lines.append("回复 /km N 确认；/km skip 忽略本轮")
         await self.wx.send_text(message.session, "\n".join(lines))
@@ -375,14 +379,25 @@ class MemoryAgent:
         lines = [f"🔍 找到 {len(hits)} 条相关记录：", ""]
         for i, h in enumerate(hits, 1):
             icon = _TYPE_ICON.get(h.message_type, "❓")
+            badge = self._version_badge(h.msg_id)
             lines.append(
-                f"{i}. {icon} {h.message_type} | {h.timestamp:%Y-%m-%d} | {h.title}"
+                f"{i}. {icon} {h.message_type} | {h.timestamp:%Y-%m-%d} | {h.title}{badge}"
             )
             if h.summary:
                 lines.append(f"   > {h.summary[:60]}")
             lines.append("")
         lines.append("回复 /1 /2 ... 查看详情并取回原文件")
         await self.wx.send_text(message.session, "\n".join(lines))
+
+    def _version_badge(self, msg_id: str) -> str:
+        """Version-chain annotation for a search hit (confirmed via /km)."""
+        chain = self.distill.version_chain(msg_id)
+        if not chain:
+            return ""
+        total = len(chain["members"])
+        if msg_id == chain["newest"]:
+            return f"  [最新版·共{total}版]"
+        return f"  [共{total}版]"
 
     def _hit_from_detail(self, detail: dict) -> SearchHit:
         """Build a SearchHit from get_detail() output (LLM direct pick)."""

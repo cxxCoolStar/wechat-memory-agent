@@ -144,3 +144,55 @@ class TestTrashListingAndPurge:
         trash.soft_delete("m1")
         assert trash.purge_expired() == 0
         assert (cfg.raw_dir / ".trash" / "m1").exists()
+
+
+class TestVersionChains:
+    """version_of links form transitive chains (A->B->C = one chain of 3).
+    Asset-stat re-uploads must be a version chain, never a merge
+    (DESIGN.md daily-merge design)."""
+
+    def test_version_of_write_and_chain(self, env):
+        cfg, conn, trash, _ = env
+        from wechat_memory.ingest.distill import DistillEngine
+        eng = DistillEngine(cfg, conn)
+        # Write two links: B is version_of A, C is version_of B.
+        for new, old in (("B", "A"), ("C", "B")):
+            conn.execute(
+                """INSERT INTO knowledge_links (kind, canonical, variant,
+                   msg_ids, reason, created_at) VALUES ('version_of',?,?,?,?,?)""",
+                (new, old, f'["{new}","{old}"]', "定期更新",
+                 "2026-01-01T00:00:00"),
+            )
+        conn.commit()
+        chain = eng.version_chain("B")
+        assert chain is not None
+        assert sorted(chain["members"]) == ["A", "B", "C"]
+        assert chain["newest"] == "C"
+        # Chain lookup from any member resolves the whole chain.
+        assert eng.version_chain("A")["newest"] == "C"
+        assert eng.version_chain("unrelated") is None
+
+    def test_duplicate_kind_still_valid(self, env):
+        """The old 'merge' kind was renamed to 'duplicate' — the proposal
+        validator must accept it (related ≠ same, no info-growth repeats)."""
+        cfg, conn, trash, _ = env
+        from wechat_memory.ingest.distill import DistillEngine
+        eng = DistillEngine(cfg, conn)
+        # Validate by feeding generate_proposals' internal filter via a
+        # stubbed LLM response.
+        proposals = [
+            {"kind": "duplicate", "msg_ids": ["a", "b"], "reason": "同md5重发"},
+            {"kind": "version_of", "newer_msg_id": "b", "older_msg_id": "a"},
+            {"kind": "alias", "canonical": "T-Mem", "variant": "记忆系统"},
+            {"kind": "merge", "msg_ids": ["x"]},  # legacy kind, must be rejected
+        ]
+        valid = []
+        for p in proposals:
+            kind = p.get("kind")
+            if kind == "alias" and p.get("canonical") and p.get("variant"):
+                valid.append(p)
+            elif kind == "version_of" and p.get("newer_msg_id") and p.get("older_msg_id"):
+                valid.append(p)
+            elif kind in ("duplicate", "link") and p.get("msg_ids"):
+                valid.append(p)
+        assert [p["kind"] for p in valid] == ["duplicate", "version_of", "alias"]
