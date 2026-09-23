@@ -123,3 +123,34 @@ class TestVoiceSilk:
 
     def test_voice_is_binary_level1(self):
         assert subtype_to_level1("voice") == "binary"
+
+
+class TestPlainTextFiles:
+    """txt files have no magic bytes — extension or content heuristic only.
+    (Regression: 资产情况.txt stored as subtype=unknown, never indexed.)"""
+
+    def test_txt_extension(self, tmp_path):
+        p = tmp_path / "a.txt"
+        p.write_text("中文文本内容", encoding="utf-8")
+        assert detect_type(p) == "text_plain"
+
+    def test_md_and_csv(self, tmp_path):
+        p = tmp_path / "a.md"
+        p.write_text("# 标题\n正文", encoding="utf-8")
+        assert detect_type(p) == "text_plain"
+        c = tmp_path / "a.csv"
+        c.write_text("a,b\n1,2", encoding="utf-8")
+        assert detect_type(c) == "text_plain"
+
+    def test_extensionless_text(self, tmp_path):
+        p = tmp_path / "noext"
+        p.write_text("无后缀的中文文本\n第二行", encoding="utf-8")
+        assert detect_type(p) == "text_plain"
+
+    def test_extensionless_binary_not_text(self, tmp_path):
+        p = tmp_path / "noext"
+        p.write_bytes(b"\x00\x01\x02\x03abc" * 10)
+        assert detect_type(p) == "unknown"
+
+    def test_text_plain_maps_to_document(self):
+        assert subtype_to_level1("text_plain") == "document"

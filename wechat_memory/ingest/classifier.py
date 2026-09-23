@@ -17,6 +17,7 @@ _SUBTYPE_TO_LEVEL1 = {
     DOC_PDF: DOCUMENT,
     DOC_DOCX: DOCUMENT,
     DOC_XLSX: DOCUMENT,
+    "text_plain": DOCUMENT,   # txt/md/csv: searchable like any document
     IMG_SCREENSHOT: IMAGE,
     IMG_PHOTO: IMAGE,
     BIN_JAR: BINARY,

@@ -139,6 +139,12 @@ class IngestPipeline:
             text = extractors.extract_docx(src)
         elif att.subtype == "xlsx":
             text = extractors.extract_xlsx(src)
+        elif att.subtype == "text_plain":
+            # Plain text IS the content — no extraction needed, just a read.
+            try:
+                text = src.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
         elif att.subtype == "archive":
             text = extractors.extract_zip_text(src)
         else:
